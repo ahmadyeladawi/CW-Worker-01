@@ -306,6 +306,16 @@ def looks_blocked(html: str, title: str) -> bool:
         "temporarily restricted",
         "please verify you are a human",
         "security check",
+        "captcha-delivery.com",
+        "geo.captcha-delivery.com",
+        "ct.captcha-delivery.com",
+        "datadome",
+        "dd={'rt'",
+        "dd={",
+        "#cmsg{",
+        "interstitial/?initialcid",
+        "px-captcha",
+        "press & hold",
         "ray id",
     ]
     if any(n in blob for n in needles):
@@ -314,7 +324,34 @@ def looks_blocked(html: str, title: str) -> bool:
         return True
     if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob or "getyourguide" in blob):
         return True
+    # Tiny interstitial shells (DataDome often ~1–3KB of challenge HTML)
+    if len(blob) < 3500 and ("captcha" in blob or "cmsg" in blob or "challenge" in blob):
+        return True
     return False
+
+
+def page_looks_real(html: str, url: str) -> bool:
+    """True when HTML looks like a real product page, not a challenge shell."""
+    h = (html or "").lower()
+    if looks_blocked(h, ""):
+        return False
+    if len(h) < 8000:
+        return False
+    signals = 0
+    for token in (
+        "tour",
+        "price",
+        "review",
+        "book now",
+        "check availability",
+        "from $",
+        "from us$",
+        "product",
+        "itinerary",
+    ):
+        if token in h:
+            signals += 1
+    return signals >= 2
 
 
 def wait_for_captcha_solve(page, detect_timeout_ms: int = 120000) -> str:
@@ -325,7 +362,6 @@ def wait_for_captcha_solve(page, detect_timeout_ms: int = 120000) -> str:
             client.send("Captcha.setAutoSolve", {"autoSolve": True})
         except Exception:
             pass
-        # Prefer explicit solve, then waitForSolve (API varies by zone).
         status = ""
         try:
             result = client.send("Captcha.solve", {"detectTimeout": int(detect_timeout_ms)})
@@ -346,38 +382,40 @@ def wait_for_captcha_solve(page, detect_timeout_ms: int = 120000) -> str:
 
 
 def wait_until_unblocked(page, timeout_ms: int = 120000) -> bool:
-    """Poll until bot interstitial is gone (or timeout)."""
+    """Poll until bot interstitial is gone and real page content appears."""
     deadline = time.time() + max(5, timeout_ms / 1000.0)
     while time.time() < deadline:
         try:
             title = page.title() or ""
             html = page.content() or ""
-            if not looks_blocked(html, title):
-                # Require some real content length so empty shells don't pass.
-                if len(html) > 4000 or "viator" not in (page.url or "").lower():
-                    return True
-                if len(html) > 1500 and "tour" in html.lower():
-                    return True
+            if page_looks_real(html, page.url or ""):
+                return True
+            if not looks_blocked(html, title) and len(html) > 12000:
+                return True
         except Exception:
             pass
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(2500)
     return False
 
 
 def navigate_ready(page, url: str) -> bool:
     """Goto + captcha solve + unblock poll. Returns False if still blocked."""
     page.goto(url, wait_until="domcontentloaded", timeout=180000)
-    page.wait_for_timeout(2000)
-    wait_for_captcha_solve(page, detect_timeout_ms=120000)
-    if wait_until_unblocked(page, timeout_ms=90000):
+    page.wait_for_timeout(2500)
+    status = wait_for_captcha_solve(page, detect_timeout_ms=120000)
+    if status == "solve_failed":
+        print("Captcha solve_failed — waiting longer for DataDome interstitial", file=sys.stderr)
+        page.wait_for_timeout(8000)
+        wait_for_captcha_solve(page, detect_timeout_ms=90000)
+    if wait_until_unblocked(page, timeout_ms=100000):
         return True
     try:
         page.reload(wait_until="domcontentloaded", timeout=180000)
     except Exception:
         page.goto(url, wait_until="domcontentloaded", timeout=180000)
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2000)
     wait_for_captcha_solve(page, detect_timeout_ms=90000)
-    return wait_until_unblocked(page, timeout_ms=60000)
+    return wait_until_unblocked(page, timeout_ms=80000)
 
 
 def main() -> int:
@@ -405,35 +443,64 @@ def main() -> int:
 
     try:
         with sync_playwright() as p:
-            browser, page = open_page(p)
-            ready = navigate_ready(page, url)
-            if not ready:
-                title = page.title() or ""
-                final_url = page.url
-                html = page.content() or ""
-                error = "blocked_or_error_page"
-                print(f"Blocked/error page detected for {url}", file=sys.stderr)
+            ready = False
+            last_html = ""
+            last_title = ""
+            # Up to 2 fresh Browser API sessions (DataDome often needs a new IP).
+            for attempt in range(1, 3):
+                print(f"Capture attempt {attempt}/2")
+                browser, page = open_page(p)
                 try:
-                    page.screenshot(path=screenshot_path, full_page=True)
-                except Exception:
-                    pass
-            else:
-                page.wait_for_timeout(1200)
-                if actions:
-                    actions_log = run_actions(page, actions)
-                    page.wait_for_timeout(1000)
-                title = page.title() or ""
-                final_url = page.url
-                html = page.content() or ""
-                content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
-                page.screenshot(path=screenshot_path, full_page=True)
-                if looks_blocked(html, title):
-                    error = "blocked_or_error_page"
-                    print(f"Blocked/error page detected for {url}", file=sys.stderr)
-            browser.close()
+                    ready = navigate_ready(page, url)
+                    last_title = page.title() or ""
+                    last_html = page.content() or ""
+                    final_url = page.url
+                    if ready and page_looks_real(last_html, final_url):
+                        page.wait_for_timeout(1200)
+                        if actions:
+                            actions_log = run_actions(page, actions)
+                            page.wait_for_timeout(1000)
+                            last_title = page.title() or ""
+                            last_html = page.content() or ""
+                            final_url = page.url
+                        title = last_title
+                        html = last_html
+                        content_hash = hashlib.sha256(
+                            html.encode("utf-8", errors="ignore")
+                        ).hexdigest()
+                        page.screenshot(path=screenshot_path, full_page=True)
+                        if looks_blocked(html, title) or not page_looks_real(html, final_url):
+                            ready = False
+                            error = "blocked_or_error_page"
+                            print(f"Blocked page after capture (attempt {attempt})", file=sys.stderr)
+                        else:
+                            error = None
+                            break
+                    else:
+                        ready = False
+                        error = "blocked_or_error_page"
+                        title = last_title
+                        html = last_html
+                        print(f"Blocked/error page detected (attempt {attempt})", file=sys.stderr)
+                        try:
+                            page.screenshot(path=screenshot_path, full_page=True)
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                if ready:
+                    break
+                # Next attempt: rotate country hint via env override for this process.
+                cur = env("BRIGHTDATA_BROWSER_COUNTRY", "us").lower() or "us"
+                nxt = "gb" if cur == "us" else "us"
+                os.environ["BRIGHTDATA_BROWSER_COUNTRY"] = nxt
+                print(f"Retrying with country={nxt}")
+
         if os.path.exists(screenshot_path):
             with open(screenshot_path, "rb") as sf:
-                # Keep screenshot even on block so operators can see the challenge page.
                 screenshot_b64 = base64.b64encode(sf.read()).decode("ascii")
     except Exception as e:
         error = str(e)
