@@ -1,0 +1,62 @@
+name: CW Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Page URL to check
+        required: true
+        type: string
+      monitor_id:
+        description: Monitor ID from Change Watch
+        required: false
+        type: string
+        default: ""
+      job_id:
+        description: External job ID
+        required: false
+        type: string
+        default: ""
+      callback_url:
+        description: Optional URL to POST the result JSON
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install chromium --with-deps
+
+      - name: Run page check
+        env:
+          CHECK_URL: ${{ inputs.url }}
+          MONITOR_ID: ${{ inputs.monitor_id }}
+          JOB_ID: ${{ inputs.job_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          WORKER_ID: "01"
+        run: python worker_check.py
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cw-result-${{ inputs.job_id || github.run_id }}
+          path: |
+            result.json
+            screenshot.png
+          if-no-files-found: warn
