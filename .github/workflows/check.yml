@@ -55,8 +55,12 @@ jobs:
           CALLBACK_URL: ${{ inputs.callback_url }}
           ACTIONS_JSON: ${{ inputs.actions_json }}
           WORKER_ID: "01"
-          BRIGHTDATA_BROWSER_USER: ${{ secrets.BRIGHTDATA_BROWSER_USER }}
+          # Browser API (Scraping Browser zone)
+          BRIGHTDATA_BROWSER_USER: brd-customer-hl_64096011-zone-scraping_browser2
           BRIGHTDATA_BROWSER_PASSWORD: ${{ secrets.BRIGHTDATA_BROWSER_PASSWORD }}
+          # Web Unlocker fallback when DataDome captcha solve_failed
+          BRIGHTDATA_API_KEY: ${{ secrets.BRIGHTDATA_API_KEY }}
+          BRIGHTDATA_ZONE: web_unlocker1
         run: python worker_check.py
 
       - name: Upload result
