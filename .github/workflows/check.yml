@@ -22,11 +22,16 @@ on:
         required: false
         type: string
         default: ""
+      actions_json:
+        description: JSON array of saved page actions (clicks/waits)
+        required: false
+        type: string
+        default: "[]"
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,6 +53,7 @@ jobs:
           MONITOR_ID: ${{ inputs.monitor_id }}
           JOB_ID: ${{ inputs.job_id }}
           CALLBACK_URL: ${{ inputs.callback_url }}
+          ACTIONS_JSON: ${{ inputs.actions_json }}
           WORKER_ID: "01"
         run: python worker_check.py
 
