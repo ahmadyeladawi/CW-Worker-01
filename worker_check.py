@@ -241,6 +241,60 @@ def run_actions(page, actions: list) -> list:
     return log
 
 
+def browser_ws_endpoint() -> str:
+    """Bright Data Browser API websocket. Never log the password."""
+    explicit = env("BRIGHTDATA_BROWSER_WS") or env("SBR_WS_CDP")
+    if explicit:
+        return explicit
+    password = env("BRIGHTDATA_BROWSER_PASSWORD")
+    if not password:
+        return ""
+    user = env(
+        "BRIGHTDATA_BROWSER_USER",
+        "brd-customer-hl_64096011-zone-scraping_browser2",
+    )
+    host = env("BRIGHTDATA_BROWSER_HOST", "brd.superproxy.io:9222")
+    from urllib.parse import quote
+
+    return f"wss://{quote(user, safe='-_.')}:{quote(password, safe='')}@{host}"
+
+
+def open_page(playwright):
+    ws = browser_ws_endpoint()
+    if ws:
+        print("Using remote Browser API")
+        browser = playwright.chromium.connect_over_cdp(ws)
+        context = browser.contexts[0] if browser.contexts else browser.new_context(
+            viewport={"width": 1366, "height": 768}
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.set_viewport_size({"width": 1366, "height": 768})
+        except Exception:
+            pass
+        return browser, page
+    print("Using local Chromium")
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    page = browser.new_page(viewport={"width": 1366, "height": 768})
+    return browser, page
+
+
+def looks_blocked(html: str, title: str) -> bool:
+    blob = f"{title or ''}\n{html or ''}".lower()
+    if "an error occurred" in blob and "right back" in blob:
+        return True
+    if "ray id" in blob and ("getyourguide" in blob or "get your guide" in blob):
+        return True
+    if "cf-browser-verification" in blob or "just a moment" in blob:
+        return True
+    if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob):
+        return True
+    return False
+
+
 def main() -> int:
     url = env("CHECK_URL")
     if not url:
@@ -266,12 +320,8 @@ def main() -> int:
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            page = browser.new_page(viewport={"width": 1366, "height": 768})
-            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            browser, page = open_page(p)
+            page.goto(url, wait_until="domcontentloaded", timeout=120000)
             page.wait_for_timeout(1500)
             if actions:
                 actions_log = run_actions(page, actions)
@@ -282,6 +332,9 @@ def main() -> int:
             content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
             page.screenshot(path=screenshot_path, full_page=True)
             browser.close()
+        if looks_blocked(html, title):
+            error = "blocked_or_error_page"
+            print(f"Blocked/error page detected for {url}", file=sys.stderr)
         if os.path.exists(screenshot_path):
             with open(screenshot_path, "rb") as sf:
                 screenshot_b64 = base64.b64encode(sf.read()).decode("ascii")
@@ -304,7 +357,7 @@ def main() -> int:
         "actions_count": len(actions),
         "actions_log": actions_log,
         "screenshot": screenshot_path if error is None and os.path.exists(screenshot_path) else None,
-        "screenshot_base64": screenshot_b64,
+        "screenshot_base64": screenshot_b64 if error is None else None,
         "started_at": started,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "error": error,
