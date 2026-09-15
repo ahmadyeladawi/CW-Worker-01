@@ -253,15 +253,6 @@ def browser_ws_endpoint() -> str:
         "BRIGHTDATA_BROWSER_USER",
         "brd-customer-hl_64096011-zone-scraping_browser2",
     )
-    # Optional geo: BRIGHTDATA_BROWSER_COUNTRY=us → append -country-us (helps some hard sites).
-    country = env("BRIGHTDATA_BROWSER_COUNTRY", "us").lower()
-    if country and re.match(r"^[a-z]{2}$", country) and f"-country-{country}" not in user:
-        user = f"{user}-country-{country}"
-    # Fresh IP per attempt (DataDome often hard-blocks a sticky peer).
-    session = env("BRIGHTDATA_BROWSER_SESSION") or f"cw{int(time.time())}{os.getpid()}"
-    session = re.sub(r"[^a-zA-Z0-9]", "", session)[:24] or "cw"
-    if "-session-" not in user:
-        user = f"{user}-session-{session}"
     host = env("BRIGHTDATA_BROWSER_HOST", "brd.superproxy.io:9222")
     from urllib.parse import quote
 
@@ -273,299 +264,35 @@ def open_page(playwright):
     if ws:
         print("Using remote Browser API")
         browser = playwright.chromium.connect_over_cdp(ws)
-        # Always a fresh page (Bright Data recommendation).
         context = browser.contexts[0] if browser.contexts else browser.new_context(
-            viewport={"width": 1920, "height": 1080}
+            viewport={"width": 1366, "height": 768}
         )
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
         try:
-            page.set_default_navigation_timeout(180000)
-            page.set_viewport_size({"width": 1920, "height": 1080})
+            page.set_viewport_size({"width": 1366, "height": 768})
         except Exception:
             pass
-        # Enable auto-solve BEFORE navigation (Bright Data default, but be explicit).
-        try:
-            client = page.context.new_cdp_session(page)
-            client.send("Captcha.setAutoSolve", {"autoSolve": True})
-        except Exception as e:
-            print(f"Captcha.setAutoSolve before nav skipped: {e}")
         return browser, page
     print("Using local Chromium")
     browser = playwright.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
-    page = browser.new_page(viewport={"width": 1920, "height": 1080})
-    page.set_default_navigation_timeout(120000)
+    page = browser.new_page(viewport={"width": 1366, "height": 768})
     return browser, page
 
 
 def looks_blocked(html: str, title: str) -> bool:
-    """True only for real interstitials — not normal pages that load DataDome JS."""
-    title_l = (title or "").lower().strip()
-    body = (html or "").lower()
-    if re.match(
-        r"^(just a moment|attention required|access denied|verification required|security check)\b",
-        title_l,
-    ):
+    blob = f"{title or ''}\n{html or ''}".lower()
+    if "an error occurred" in blob and "right back" in blob:
         return True
-    needles = [
-        "just a moment",
-        "cf-browser-verification",
-        "attention required",
-        "verification required",
-        "slide right to secure",
-        "unusual activity",
-        "automated (bot) activity",
-        "acceso está restringido",
-        "acceso esta restringido",
-        "restringido temporalmente",
-        "access is temporarily restricted",
-        "temporarily restricted",
-        "please verify you are a human",
-        "interstitial/?initialcid",
-        "geo.captcha-delivery.com/captcha/",
-        "captcha-delivery.com/captcha/",
-        "#cmsg{",
-        "px-captcha",
-        "press & hold",
-    ]
-    if any(n in body for n in needles):
+    if "ray id" in blob and ("getyourguide" in blob or "get your guide" in blob):
         return True
-    if "an error occurred" in body and "right back" in body:
+    if "cf-browser-verification" in blob or "just a moment" in blob:
         return True
-    # Short challenge shells only (full Viator HTML is huge and still mentions datadome).
-    if len(body) > 0 and len(body) < 12000 and (
-        "captcha-delivery" in body
-        or "#cmsg" in body
-        or ("datadome" in body and "captcha" in body)
-    ):
+    if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob):
         return True
     return False
-
-
-def page_looks_real(html: str, url: str) -> bool:
-    """True when HTML looks like a real product page, not a challenge shell."""
-    h = (html or "").lower()
-    if looks_blocked(h, ""):
-        return False
-    if len(h) < 8000:
-        return False
-    signals = 0
-    for token in (
-        "tour",
-        "price",
-        "review",
-        "book now",
-        "check availability",
-        "from $",
-        "from us$",
-        "product",
-        "itinerary",
-        "viator",
-        "xcaret",
-        "cancun",
-    ):
-        if token in h:
-            signals += 1
-    return signals >= 2
-
-
-def wait_for_captcha_solve(page, detect_timeout_ms: int = 90000) -> str:
-    """Wait for Bright Data Browser API captcha solver after navigation."""
-    try:
-        client = page.context.new_cdp_session(page)
-        try:
-            client.send("Captcha.setAutoSolve", {"autoSolve": True})
-        except Exception:
-            pass
-        timeout = int(min(120000, max(30000, detect_timeout_ms)))
-        status = ""
-        # Prefer waitForSolve (waits for in-flight auto-solve); fall back to solve.
-        try:
-            result = client.send("Captcha.waitForSolve", {"detectTimeout": timeout})
-            if isinstance(result, dict):
-                status = str(result.get("status") or "")
-        except Exception:
-            status = ""
-        if not status or status in ("not_detected", "unknown", "invalid"):
-            try:
-                result = client.send("Captcha.solve", {"detectTimeout": timeout})
-                if isinstance(result, dict):
-                    status = str(result.get("status") or status)
-                    if result.get("error"):
-                        print(f"Captcha error detail: {result.get('error')}")
-                    if result.get("type"):
-                        print(f"Captcha type: {result.get('type')}")
-            except Exception as e:
-                print(f"Captcha.solve error: {e}")
-        print(f"Captcha solve status: {status or 'unknown'}")
-        return status or "unknown"
-    except Exception as e:
-        print(f"Captcha solve skipped: {e}")
-        return "skipped"
-
-
-def wait_until_unblocked(page, timeout_ms: int = 60000) -> bool:
-    """Poll until bot interstitial is gone and real page content appears."""
-    deadline = time.time() + max(5, timeout_ms / 1000.0)
-    while time.time() < deadline:
-        try:
-            title = page.title() or ""
-            html = page.content() or ""
-            if page_looks_real(html, page.url or ""):
-                return True
-            if not looks_blocked(html, title) and len(html) > 20000:
-                return True
-        except Exception:
-            pass
-        page.wait_for_timeout(2500)
-    return False
-
-
-def navigate_ready(page, url: str) -> bool:
-    """Goto + captcha wait + unblock poll. Retry late unblock after solve_failed."""
-    page.goto(url, wait_until="domcontentloaded", timeout=120000)
-    page.wait_for_timeout(2500)
-    status = wait_for_captcha_solve(page, detect_timeout_ms=90000)
-    html = ""
-    title = ""
-    try:
-        title = page.title() or ""
-        html = page.content() or ""
-    except Exception:
-        pass
-
-    if page_looks_real(html, page.url or ""):
-        return True
-
-    # solve_failed is common on DataDome — keep polling; auto-solve sometimes finishes late.
-    if status == "solve_failed" or looks_blocked(html, title):
-        print(
-            "Captcha solve_failed / blocked — polling for late unblock before new session",
-            file=sys.stderr,
-        )
-        if wait_until_unblocked(page, timeout_ms=75000):
-            return True
-        return False
-
-    if wait_until_unblocked(page, timeout_ms=60000):
-        return True
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=90000)
-    except Exception:
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
-    page.wait_for_timeout(2000)
-    status2 = wait_for_captcha_solve(page, detect_timeout_ms=60000)
-    if page_looks_real(page.content() or "", page.url or ""):
-        return True
-    if status2 == "solve_failed":
-        return wait_until_unblocked(page, timeout_ms=45000)
-    return wait_until_unblocked(page, timeout_ms=45000)
-
-
-def try_unlocker_fallback(url: str, screenshot_path: str) -> dict | None:
-    """
-    When Scraping Browser captcha fails and there are no click actions,
-    fetch rendered HTML via Web Unlocker API and screenshot with local Chromium.
-    Needs BRIGHTDATA_API_KEY (+ optional BRIGHTDATA_ZONE).
-    """
-    api_key = env("BRIGHTDATA_API_KEY") or env("UNLOCKER_API_KEY")
-    zone = env("BRIGHTDATA_ZONE", "web_unlocker1")
-    if not api_key:
-        print("Unlocker fallback skipped: no BRIGHTDATA_API_KEY", file=sys.stderr)
-        return None
-    print(f"Unlocker fallback: zone={zone} render=true")
-    html = ""
-    last_err = ""
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(
-                "https://api.brightdata.com/request",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "zone": zone,
-                    "url": url,
-                    "format": "raw",
-                    "country": "us",
-                    "render": True,
-                },
-                timeout=150,
-            )
-            brd_err = r.headers.get("x-brd-error") or ""
-            brd_code = r.headers.get("x-brd-error-code") or ""
-            if brd_err or brd_code:
-                last_err = f"{brd_code} {brd_err}".strip()
-                print(f"Unlocker attempt {attempt} blocked: {last_err}", file=sys.stderr)
-                time.sleep(2)
-                continue
-            html = r.text or ""
-            if r.ok and len(html) > 5000 and not looks_blocked(html, ""):
-                break
-            last_err = f"http_{r.status_code}_len_{len(html)}"
-            print(f"Unlocker attempt {attempt} weak body: {last_err}", file=sys.stderr)
-            html = ""
-        except Exception as e:
-            last_err = str(e)
-            print(f"Unlocker attempt {attempt} error: {e}", file=sys.stderr)
-        time.sleep(2)
-    if not html or len(html) < 5000:
-        print(f"Unlocker fallback failed: {last_err}", file=sys.stderr)
-        return None
-    if looks_blocked(html, ""):
-        print("Unlocker HTML still looks blocked", file=sys.stderr)
-        return None
-
-    title = ""
-    m = re.search(r"<title[^>]*>([^<]*)</title>", html, re.I)
-    if m:
-        title = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        try:
-            page = browser.new_page(viewport={"width": 1920, "height": 1080})
-            # Force desktop viewport meta so layout is not phone-width.
-            doc = re.sub(
-                r'<meta[^>]+name=["\']viewport["\'][^>]*>',
-                '<meta name="viewport" content="width=1920, initial-scale=1">',
-                html,
-                flags=re.I,
-            )
-            if not re.search(r'name=["\']viewport["\']', doc, re.I):
-                doc = re.sub(
-                    r"<head([^>]*)>",
-                    r'<head\1><meta name="viewport" content="width=1920, initial-scale=1">',
-                    doc,
-                    count=1,
-                    flags=re.I,
-                )
-            page.set_content(doc, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1500)
-            try:
-                title = (page.title() or title or "").strip()[:200]
-            except Exception:
-                pass
-            page.screenshot(path=screenshot_path, full_page=True)
-        finally:
-            browser.close()
-
-    if not os.path.exists(screenshot_path):
-        return None
-    content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
-    print(f"Unlocker fallback OK title={title[:60]}")
-    return {
-        "html": html,
-        "title": title,
-        "content_hash": content_hash,
-        "via": "unlocker_fallback",
-    }
 
 
 def main() -> int:
@@ -593,74 +320,21 @@ def main() -> int:
 
     try:
         with sync_playwright() as p:
-            ready = False
-            last_html = ""
-            last_title = ""
-            # Up to 4 fresh Browser API sessions (new IP/session each time).
-            countries = ["us", "gb", "de", "nl"]
-            for attempt in range(1, 5):
-                country = countries[(attempt - 1) % len(countries)]
-                os.environ["BRIGHTDATA_BROWSER_COUNTRY"] = country
-                os.environ["BRIGHTDATA_BROWSER_SESSION"] = f"cw{attempt}{int(time.time())}"
-                print(f"Capture attempt {attempt}/4 country={country}")
-                browser, page = open_page(p)
-                try:
-                    ready = navigate_ready(page, url)
-                    last_title = page.title() or ""
-                    last_html = page.content() or ""
-                    final_url = page.url
-                    if ready and page_looks_real(last_html, final_url):
-                        page.wait_for_timeout(1200)
-                        if actions:
-                            actions_log = run_actions(page, actions)
-                            page.wait_for_timeout(1000)
-                            last_title = page.title() or ""
-                            last_html = page.content() or ""
-                            final_url = page.url
-                        title = last_title
-                        html = last_html
-                        content_hash = hashlib.sha256(
-                            html.encode("utf-8", errors="ignore")
-                        ).hexdigest()
-                        page.screenshot(path=screenshot_path, full_page=True)
-                        if looks_blocked(html, title) or not page_looks_real(html, final_url):
-                            ready = False
-                            error = "blocked_or_error_page"
-                            print(f"Blocked page after capture (attempt {attempt})", file=sys.stderr)
-                        else:
-                            error = None
-                            break
-                    else:
-                        ready = False
-                        error = "blocked_or_error_page"
-                        title = last_title
-                        html = last_html
-                        print(f"Blocked/error page detected (attempt {attempt})", file=sys.stderr)
-                        try:
-                            page.screenshot(path=screenshot_path, full_page=True)
-                        except Exception:
-                            pass
-                finally:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-                if ready:
-                    break
-                print(f"Retrying with new session/country after attempt {attempt}")
-
-        # Browser API lost to DataDome — try Web Unlocker HTML → local screenshot (no clicks).
-        if (not ready or error) and not actions:
-            fb = try_unlocker_fallback(url, screenshot_path)
-            if fb:
-                html = fb["html"]
-                title = fb["title"]
-                content_hash = fb["content_hash"]
-                final_url = url
-                error = None
-                ready = True
-                print("Recovered via Unlocker fallback")
-
+            browser, page = open_page(p)
+            page.goto(url, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(1500)
+            if actions:
+                actions_log = run_actions(page, actions)
+                page.wait_for_timeout(1000)
+            title = page.title() or ""
+            final_url = page.url
+            html = page.content() or ""
+            content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
+            page.screenshot(path=screenshot_path, full_page=True)
+            browser.close()
+        if looks_blocked(html, title):
+            error = "blocked_or_error_page"
+            print(f"Blocked/error page detected for {url}", file=sys.stderr)
         if os.path.exists(screenshot_path):
             with open(screenshot_path, "rb") as sf:
                 screenshot_b64 = base64.b64encode(sf.read()).decode("ascii")
@@ -682,8 +356,8 @@ def main() -> int:
         "content_hash": content_hash or None,
         "actions_count": len(actions),
         "actions_log": actions_log,
-        "screenshot": screenshot_path if os.path.exists(screenshot_path) else None,
-        "screenshot_base64": screenshot_b64,
+        "screenshot": screenshot_path if error is None and os.path.exists(screenshot_path) else None,
+        "screenshot_base64": screenshot_b64 if error is None else None,
         "started_at": started,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "error": error,
