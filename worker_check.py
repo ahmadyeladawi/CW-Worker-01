@@ -253,6 +253,10 @@ def browser_ws_endpoint() -> str:
         "BRIGHTDATA_BROWSER_USER",
         "brd-customer-hl_64096011-zone-scraping_browser2",
     )
+    # Optional geo: BRIGHTDATA_BROWSER_COUNTRY=us → append -country-us (helps some hard sites).
+    country = env("BRIGHTDATA_BROWSER_COUNTRY", "us").lower()
+    if country and re.match(r"^[a-z]{2}$", country) and f"-country-{country}" not in user:
+        user = f"{user}-country-{country}"
     host = env("BRIGHTDATA_BROWSER_HOST", "brd.superproxy.io:9222")
     from urllib.parse import quote
 
@@ -264,13 +268,13 @@ def open_page(playwright):
     if ws:
         print("Using remote Browser API")
         browser = playwright.chromium.connect_over_cdp(ws)
-        # Fresh page per job (Bright Data recommendation).
+        # Always a fresh page (Bright Data recommendation).
         context = browser.contexts[0] if browser.contexts else browser.new_context(
             viewport={"width": 1366, "height": 768}
         )
         page = context.new_page()
         try:
-            page.set_default_navigation_timeout(120000)
+            page.set_default_navigation_timeout(180000)
             page.set_viewport_size({"width": 1366, "height": 768})
         except Exception:
             pass
@@ -287,67 +291,93 @@ def open_page(playwright):
 
 def looks_blocked(html: str, title: str) -> bool:
     blob = f"{title or ''}\n{html or ''}".lower()
+    needles = [
+        "just a moment",
+        "cf-browser-verification",
+        "attention required",
+        "verification required",
+        "slide right to secure",
+        "unusual activity",
+        "automated (bot) activity",
+        "acceso está restringido",
+        "acceso esta restringido",
+        "restringido temporalmente",
+        "access is temporarily restricted",
+        "temporarily restricted",
+        "please verify you are a human",
+        "security check",
+        "ray id",
+    ]
+    if any(n in blob for n in needles):
+        return True
     if "an error occurred" in blob and "right back" in blob:
         return True
-    if "ray id" in blob and ("getyourguide" in blob or "get your guide" in blob):
-        return True
-    if "cf-browser-verification" in blob or "just a moment" in blob:
-        return True
-    if "attention required" in blob and "cloudflare" in blob:
-        return True
-    if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob):
+    if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob or "getyourguide" in blob):
         return True
     return False
 
 
-def wait_for_captcha_solve(page, detect_timeout_ms: int = 90000) -> str:
+def wait_for_captcha_solve(page, detect_timeout_ms: int = 120000) -> str:
     """Ask Bright Data Browser API to finish Cloudflare/CAPTCHA if present."""
     try:
         client = page.context.new_cdp_session(page)
-        result = client.send(
-            "Captcha.waitForSolve",
-            {"detectTimeout": int(detect_timeout_ms)},
-        )
+        try:
+            client.send("Captcha.setAutoSolve", {"autoSolve": True})
+        except Exception:
+            pass
+        # Prefer explicit solve, then waitForSolve (API varies by zone).
         status = ""
-        if isinstance(result, dict):
-            status = str(result.get("status") or "")
-        print(f"Captcha.waitForSolve status: {status or 'unknown'}")
+        try:
+            result = client.send("Captcha.solve", {"detectTimeout": int(detect_timeout_ms)})
+            if isinstance(result, dict):
+                status = str(result.get("status") or "")
+        except Exception:
+            result = client.send(
+                "Captcha.waitForSolve",
+                {"detectTimeout": int(detect_timeout_ms)},
+            )
+            if isinstance(result, dict):
+                status = str(result.get("status") or "")
+        print(f"Captcha solve status: {status or 'unknown'}")
         return status or "unknown"
     except Exception as e:
-        print(f"Captcha.waitForSolve skipped: {e}")
+        print(f"Captcha solve skipped: {e}")
         return "skipped"
 
 
-def wait_until_unblocked(page, timeout_ms: int = 90000) -> bool:
-    """Poll until Cloudflare interstitial is gone (or timeout)."""
+def wait_until_unblocked(page, timeout_ms: int = 120000) -> bool:
+    """Poll until bot interstitial is gone (or timeout)."""
     deadline = time.time() + max(5, timeout_ms / 1000.0)
     while time.time() < deadline:
         try:
             title = page.title() or ""
-            # Cheap check first — title alone catches "Just a moment..."
-            if "just a moment" not in title.lower():
-                html = page.content() or ""
-                if not looks_blocked(html, title):
+            html = page.content() or ""
+            if not looks_blocked(html, title):
+                # Require some real content length so empty shells don't pass.
+                if len(html) > 4000 or "viator" not in (page.url or "").lower():
+                    return True
+                if len(html) > 1500 and "tour" in html.lower():
                     return True
         except Exception:
             pass
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)
     return False
 
 
 def navigate_ready(page, url: str) -> bool:
-    """Goto + captcha wait + unblock poll. Returns False if still blocked."""
-    page.goto(url, wait_until="domcontentloaded", timeout=120000)
-    wait_for_captcha_solve(page, detect_timeout_ms=90000)
-    if wait_until_unblocked(page, timeout_ms=45000):
+    """Goto + captcha solve + unblock poll. Returns False if still blocked."""
+    page.goto(url, wait_until="domcontentloaded", timeout=180000)
+    page.wait_for_timeout(2000)
+    wait_for_captcha_solve(page, detect_timeout_ms=120000)
+    if wait_until_unblocked(page, timeout_ms=90000):
         return True
-    # One reload retry — CF sometimes sticks on first paint.
     try:
-        page.reload(wait_until="domcontentloaded", timeout=120000)
+        page.reload(wait_until="domcontentloaded", timeout=180000)
     except Exception:
-        page.goto(url, wait_until="domcontentloaded", timeout=120000)
-    wait_for_captcha_solve(page, detect_timeout_ms=60000)
-    return wait_until_unblocked(page, timeout_ms=45000)
+        page.goto(url, wait_until="domcontentloaded", timeout=180000)
+    page.wait_for_timeout(1500)
+    wait_for_captcha_solve(page, detect_timeout_ms=90000)
+    return wait_until_unblocked(page, timeout_ms=60000)
 
 
 def main() -> int:
