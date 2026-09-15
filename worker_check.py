@@ -1,9 +1,10 @@
 """
-Change Watch worker — open page, screenshot, write result.json
+Change Watch worker — open page, screenshot, write result.json, POST callback.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -36,6 +37,8 @@ def main() -> int:
     title = ""
     final_url = url
     content_hash = ""
+    html = ""
+    screenshot_b64 = None
 
     try:
         with sync_playwright() as p:
@@ -52,9 +55,15 @@ def main() -> int:
             content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
             page.screenshot(path=screenshot_path, full_page=True)
             browser.close()
+        if os.path.exists(screenshot_path):
+            with open(screenshot_path, "rb") as sf:
+                screenshot_b64 = base64.b64encode(sf.read()).decode("ascii")
     except Exception as e:
         error = str(e)
         print(f"Capture failed: {error}", file=sys.stderr)
+
+    # Keep body size reasonable for callback JSON.
+    body_out = html[:400000] if html else ""
 
     result = {
         "ok": error is None,
@@ -64,8 +73,10 @@ def main() -> int:
         "url": url,
         "final_url": final_url,
         "title": title,
+        "body": body_out,
         "content_hash": content_hash or None,
         "screenshot": screenshot_path if error is None and os.path.exists(screenshot_path) else None,
+        "screenshot_base64": screenshot_b64,
         "started_at": started,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "error": error,
@@ -74,14 +85,19 @@ def main() -> int:
     }
 
     with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        # Do not store huge base64 in artifact file twice.
+        slim = dict(result)
+        if slim.get("screenshot_base64"):
+            slim["screenshot_base64"] = f"<omitted {len(screenshot_b64 or '')} chars>"
+        json.dump(slim, f, ensure_ascii=False, indent=2)
 
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k != "screenshot_base64"}, ensure_ascii=False, indent=2))
 
     if callback_url:
         try:
-            r = requests.post(callback_url, json=result, timeout=30)
+            r = requests.post(callback_url, json=result, timeout=60)
             print(f"Callback status: {r.status_code}")
+            print((r.text or "")[:500])
         except Exception as e:
             print(f"Callback failed: {e}", file=sys.stderr)
 
