@@ -264,11 +264,13 @@ def open_page(playwright):
     if ws:
         print("Using remote Browser API")
         browser = playwright.chromium.connect_over_cdp(ws)
+        # Fresh page per job (Bright Data recommendation).
         context = browser.contexts[0] if browser.contexts else browser.new_context(
             viewport={"width": 1366, "height": 768}
         )
-        page = context.pages[0] if context.pages else context.new_page()
+        page = context.new_page()
         try:
+            page.set_default_navigation_timeout(120000)
             page.set_viewport_size({"width": 1366, "height": 768})
         except Exception:
             pass
@@ -279,6 +281,7 @@ def open_page(playwright):
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
     page = browser.new_page(viewport={"width": 1366, "height": 768})
+    page.set_default_navigation_timeout(120000)
     return browser, page
 
 
@@ -290,9 +293,61 @@ def looks_blocked(html: str, title: str) -> bool:
         return True
     if "cf-browser-verification" in blob or "just a moment" in blob:
         return True
+    if "attention required" in blob and "cloudflare" in blob:
+        return True
     if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob):
         return True
     return False
+
+
+def wait_for_captcha_solve(page, detect_timeout_ms: int = 90000) -> str:
+    """Ask Bright Data Browser API to finish Cloudflare/CAPTCHA if present."""
+    try:
+        client = page.context.new_cdp_session(page)
+        result = client.send(
+            "Captcha.waitForSolve",
+            {"detectTimeout": int(detect_timeout_ms)},
+        )
+        status = ""
+        if isinstance(result, dict):
+            status = str(result.get("status") or "")
+        print(f"Captcha.waitForSolve status: {status or 'unknown'}")
+        return status or "unknown"
+    except Exception as e:
+        print(f"Captcha.waitForSolve skipped: {e}")
+        return "skipped"
+
+
+def wait_until_unblocked(page, timeout_ms: int = 90000) -> bool:
+    """Poll until Cloudflare interstitial is gone (or timeout)."""
+    deadline = time.time() + max(5, timeout_ms / 1000.0)
+    while time.time() < deadline:
+        try:
+            title = page.title() or ""
+            # Cheap check first — title alone catches "Just a moment..."
+            if "just a moment" not in title.lower():
+                html = page.content() or ""
+                if not looks_blocked(html, title):
+                    return True
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+    return False
+
+
+def navigate_ready(page, url: str) -> bool:
+    """Goto + captcha wait + unblock poll. Returns False if still blocked."""
+    page.goto(url, wait_until="domcontentloaded", timeout=120000)
+    wait_for_captcha_solve(page, detect_timeout_ms=90000)
+    if wait_until_unblocked(page, timeout_ms=45000):
+        return True
+    # One reload retry — CF sometimes sticks on first paint.
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=120000)
+    except Exception:
+        page.goto(url, wait_until="domcontentloaded", timeout=120000)
+    wait_for_captcha_solve(page, detect_timeout_ms=60000)
+    return wait_until_unblocked(page, timeout_ms=45000)
 
 
 def main() -> int:
@@ -321,22 +376,34 @@ def main() -> int:
     try:
         with sync_playwright() as p:
             browser, page = open_page(p)
-            page.goto(url, wait_until="domcontentloaded", timeout=120000)
-            page.wait_for_timeout(1500)
-            if actions:
-                actions_log = run_actions(page, actions)
-                page.wait_for_timeout(1000)
-            title = page.title() or ""
-            final_url = page.url
-            html = page.content() or ""
-            content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
-            page.screenshot(path=screenshot_path, full_page=True)
+            ready = navigate_ready(page, url)
+            if not ready:
+                title = page.title() or ""
+                final_url = page.url
+                html = page.content() or ""
+                error = "blocked_or_error_page"
+                print(f"Blocked/error page detected for {url}", file=sys.stderr)
+                try:
+                    page.screenshot(path=screenshot_path, full_page=True)
+                except Exception:
+                    pass
+            else:
+                page.wait_for_timeout(1200)
+                if actions:
+                    actions_log = run_actions(page, actions)
+                    page.wait_for_timeout(1000)
+                title = page.title() or ""
+                final_url = page.url
+                html = page.content() or ""
+                content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
+                page.screenshot(path=screenshot_path, full_page=True)
+                if looks_blocked(html, title):
+                    error = "blocked_or_error_page"
+                    print(f"Blocked/error page detected for {url}", file=sys.stderr)
             browser.close()
-        if looks_blocked(html, title):
-            error = "blocked_or_error_page"
-            print(f"Blocked/error page detected for {url}", file=sys.stderr)
         if os.path.exists(screenshot_path):
             with open(screenshot_path, "rb") as sf:
+                # Keep screenshot even on block so operators can see the challenge page.
                 screenshot_b64 = base64.b64encode(sf.read()).decode("ascii")
     except Exception as e:
         error = str(e)
@@ -356,8 +423,8 @@ def main() -> int:
         "content_hash": content_hash or None,
         "actions_count": len(actions),
         "actions_log": actions_log,
-        "screenshot": screenshot_path if error is None and os.path.exists(screenshot_path) else None,
-        "screenshot_base64": screenshot_b64 if error is None else None,
+        "screenshot": screenshot_path if os.path.exists(screenshot_path) else None,
+        "screenshot_base64": screenshot_b64,
         "started_at": started,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "error": error,
