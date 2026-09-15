@@ -257,6 +257,11 @@ def browser_ws_endpoint() -> str:
     country = env("BRIGHTDATA_BROWSER_COUNTRY", "us").lower()
     if country and re.match(r"^[a-z]{2}$", country) and f"-country-{country}" not in user:
         user = f"{user}-country-{country}"
+    # Fresh IP per attempt (DataDome often hard-blocks a sticky peer).
+    session = env("BRIGHTDATA_BROWSER_SESSION") or f"cw{int(time.time())}{os.getpid()}"
+    session = re.sub(r"[^a-zA-Z0-9]", "", session)[:24] or "cw"
+    if "-session-" not in user:
+        user = f"{user}-session-{session}"
     host = env("BRIGHTDATA_BROWSER_HOST", "brd.superproxy.io:9222")
     from urllib.parse import quote
 
@@ -270,27 +275,40 @@ def open_page(playwright):
         browser = playwright.chromium.connect_over_cdp(ws)
         # Always a fresh page (Bright Data recommendation).
         context = browser.contexts[0] if browser.contexts else browser.new_context(
-            viewport={"width": 1366, "height": 768}
+            viewport={"width": 1920, "height": 1080}
         )
         page = context.new_page()
         try:
             page.set_default_navigation_timeout(180000)
-            page.set_viewport_size({"width": 1366, "height": 768})
+            page.set_viewport_size({"width": 1920, "height": 1080})
         except Exception:
             pass
+        # Enable auto-solve BEFORE navigation (Bright Data default, but be explicit).
+        try:
+            client = page.context.new_cdp_session(page)
+            client.send("Captcha.setAutoSolve", {"autoSolve": True})
+        except Exception as e:
+            print(f"Captcha.setAutoSolve before nav skipped: {e}")
         return browser, page
     print("Using local Chromium")
     browser = playwright.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
-    page = browser.new_page(viewport={"width": 1366, "height": 768})
+    page = browser.new_page(viewport={"width": 1920, "height": 1080})
     page.set_default_navigation_timeout(120000)
     return browser, page
 
 
 def looks_blocked(html: str, title: str) -> bool:
-    blob = f"{title or ''}\n{html or ''}".lower()
+    """True only for real interstitials — not normal pages that load DataDome JS."""
+    title_l = (title or "").lower().strip()
+    body = (html or "").lower()
+    if re.match(
+        r"^(just a moment|attention required|access denied|verification required|security check)\b",
+        title_l,
+    ):
+        return True
     needles = [
         "just a moment",
         "cf-browser-verification",
@@ -305,27 +323,23 @@ def looks_blocked(html: str, title: str) -> bool:
         "access is temporarily restricted",
         "temporarily restricted",
         "please verify you are a human",
-        "security check",
-        "captcha-delivery.com",
-        "geo.captcha-delivery.com",
-        "ct.captcha-delivery.com",
-        "datadome",
-        "dd={'rt'",
-        "dd={",
-        "#cmsg{",
         "interstitial/?initialcid",
+        "geo.captcha-delivery.com/captcha/",
+        "captcha-delivery.com/captcha/",
+        "#cmsg{",
         "px-captcha",
         "press & hold",
-        "ray id",
     ]
-    if any(n in blob for n in needles):
+    if any(n in body for n in needles):
         return True
-    if "an error occurred" in blob and "right back" in blob:
+    if "an error occurred" in body and "right back" in body:
         return True
-    if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob or "getyourguide" in blob):
-        return True
-    # Tiny interstitial shells (DataDome often ~1–3KB of challenge HTML)
-    if len(blob) < 3500 and ("captcha" in blob or "cmsg" in blob or "challenge" in blob):
+    # Short challenge shells only (full Viator HTML is huge and still mentions datadome).
+    if len(body) > 0 and len(body) < 12000 and (
+        "captcha-delivery" in body
+        or "#cmsg" in body
+        or ("datadome" in body and "captcha" in body)
+    ):
         return True
     return False
 
@@ -348,32 +362,43 @@ def page_looks_real(html: str, url: str) -> bool:
         "from us$",
         "product",
         "itinerary",
+        "viator",
+        "xcaret",
+        "cancun",
     ):
         if token in h:
             signals += 1
     return signals >= 2
 
 
-def wait_for_captcha_solve(page, detect_timeout_ms: int = 120000) -> str:
-    """Ask Bright Data Browser API to finish Cloudflare/CAPTCHA if present."""
+def wait_for_captcha_solve(page, detect_timeout_ms: int = 90000) -> str:
+    """Wait for Bright Data Browser API captcha solver after navigation."""
     try:
         client = page.context.new_cdp_session(page)
         try:
             client.send("Captcha.setAutoSolve", {"autoSolve": True})
         except Exception:
             pass
+        timeout = int(min(120000, max(30000, detect_timeout_ms)))
         status = ""
+        # Prefer waitForSolve (waits for in-flight auto-solve); fall back to solve.
         try:
-            result = client.send("Captcha.solve", {"detectTimeout": int(detect_timeout_ms)})
+            result = client.send("Captcha.waitForSolve", {"detectTimeout": timeout})
             if isinstance(result, dict):
                 status = str(result.get("status") or "")
         except Exception:
-            result = client.send(
-                "Captcha.waitForSolve",
-                {"detectTimeout": int(detect_timeout_ms)},
-            )
-            if isinstance(result, dict):
-                status = str(result.get("status") or "")
+            status = ""
+        if not status or status in ("not_detected", "unknown", "invalid"):
+            try:
+                result = client.send("Captcha.solve", {"detectTimeout": timeout})
+                if isinstance(result, dict):
+                    status = str(result.get("status") or status)
+                    if result.get("error"):
+                        print(f"Captcha error detail: {result.get('error')}")
+                    if result.get("type"):
+                        print(f"Captcha type: {result.get('type')}")
+            except Exception as e:
+                print(f"Captcha.solve error: {e}")
         print(f"Captcha solve status: {status or 'unknown'}")
         return status or "unknown"
     except Exception as e:
@@ -381,7 +406,7 @@ def wait_for_captcha_solve(page, detect_timeout_ms: int = 120000) -> str:
         return "skipped"
 
 
-def wait_until_unblocked(page, timeout_ms: int = 120000) -> bool:
+def wait_until_unblocked(page, timeout_ms: int = 60000) -> bool:
     """Poll until bot interstitial is gone and real page content appears."""
     deadline = time.time() + max(5, timeout_ms / 1000.0)
     while time.time() < deadline:
@@ -390,7 +415,7 @@ def wait_until_unblocked(page, timeout_ms: int = 120000) -> bool:
             html = page.content() or ""
             if page_looks_real(html, page.url or ""):
                 return True
-            if not looks_blocked(html, title) and len(html) > 12000:
+            if not looks_blocked(html, title) and len(html) > 20000:
                 return True
         except Exception:
             pass
@@ -399,23 +424,44 @@ def wait_until_unblocked(page, timeout_ms: int = 120000) -> bool:
 
 
 def navigate_ready(page, url: str) -> bool:
-    """Goto + captcha solve + unblock poll. Returns False if still blocked."""
-    page.goto(url, wait_until="domcontentloaded", timeout=180000)
+    """Goto + captcha wait + unblock poll. Retry late unblock after solve_failed."""
+    page.goto(url, wait_until="domcontentloaded", timeout=120000)
     page.wait_for_timeout(2500)
-    status = wait_for_captcha_solve(page, detect_timeout_ms=120000)
-    if status == "solve_failed":
-        print("Captcha solve_failed — waiting longer for DataDome interstitial", file=sys.stderr)
-        page.wait_for_timeout(8000)
-        wait_for_captcha_solve(page, detect_timeout_ms=90000)
-    if wait_until_unblocked(page, timeout_ms=100000):
+    status = wait_for_captcha_solve(page, detect_timeout_ms=90000)
+    html = ""
+    title = ""
+    try:
+        title = page.title() or ""
+        html = page.content() or ""
+    except Exception:
+        pass
+
+    if page_looks_real(html, page.url or ""):
+        return True
+
+    # solve_failed is common on DataDome — keep polling; auto-solve sometimes finishes late.
+    if status == "solve_failed" or looks_blocked(html, title):
+        print(
+            "Captcha solve_failed / blocked — polling for late unblock before new session",
+            file=sys.stderr,
+        )
+        if wait_until_unblocked(page, timeout_ms=75000):
+            return True
+        return False
+
+    if wait_until_unblocked(page, timeout_ms=60000):
         return True
     try:
-        page.reload(wait_until="domcontentloaded", timeout=180000)
+        page.reload(wait_until="domcontentloaded", timeout=90000)
     except Exception:
-        page.goto(url, wait_until="domcontentloaded", timeout=180000)
+        page.goto(url, wait_until="domcontentloaded", timeout=90000)
     page.wait_for_timeout(2000)
-    wait_for_captcha_solve(page, detect_timeout_ms=90000)
-    return wait_until_unblocked(page, timeout_ms=80000)
+    status2 = wait_for_captcha_solve(page, detect_timeout_ms=60000)
+    if page_looks_real(page.content() or "", page.url or ""):
+        return True
+    if status2 == "solve_failed":
+        return wait_until_unblocked(page, timeout_ms=45000)
+    return wait_until_unblocked(page, timeout_ms=45000)
 
 
 def main() -> int:
@@ -446,9 +492,13 @@ def main() -> int:
             ready = False
             last_html = ""
             last_title = ""
-            # Up to 2 fresh Browser API sessions (DataDome often needs a new IP).
-            for attempt in range(1, 3):
-                print(f"Capture attempt {attempt}/2")
+            # Up to 4 fresh Browser API sessions (new IP/session each time).
+            countries = ["us", "gb", "de", "nl"]
+            for attempt in range(1, 5):
+                country = countries[(attempt - 1) % len(countries)]
+                os.environ["BRIGHTDATA_BROWSER_COUNTRY"] = country
+                os.environ["BRIGHTDATA_BROWSER_SESSION"] = f"cw{attempt}{int(time.time())}"
+                print(f"Capture attempt {attempt}/4 country={country}")
                 browser, page = open_page(p)
                 try:
                     ready = navigate_ready(page, url)
@@ -493,11 +543,7 @@ def main() -> int:
                         pass
                 if ready:
                     break
-                # Next attempt: rotate country hint via env override for this process.
-                cur = env("BRIGHTDATA_BROWSER_COUNTRY", "us").lower() or "us"
-                nxt = "gb" if cur == "us" else "us"
-                os.environ["BRIGHTDATA_BROWSER_COUNTRY"] = nxt
-                print(f"Retrying with country={nxt}")
+                print(f"Retrying with new session/country after attempt {attempt}")
 
         if os.path.exists(screenshot_path):
             with open(screenshot_path, "rb") as sf:
