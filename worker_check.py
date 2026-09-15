@@ -464,6 +464,110 @@ def navigate_ready(page, url: str) -> bool:
     return wait_until_unblocked(page, timeout_ms=45000)
 
 
+def try_unlocker_fallback(url: str, screenshot_path: str) -> dict | None:
+    """
+    When Scraping Browser captcha fails and there are no click actions,
+    fetch rendered HTML via Web Unlocker API and screenshot with local Chromium.
+    Needs BRIGHTDATA_API_KEY (+ optional BRIGHTDATA_ZONE).
+    """
+    api_key = env("BRIGHTDATA_API_KEY") or env("UNLOCKER_API_KEY")
+    zone = env("BRIGHTDATA_ZONE", "web_unlocker1")
+    if not api_key:
+        print("Unlocker fallback skipped: no BRIGHTDATA_API_KEY", file=sys.stderr)
+        return None
+    print(f"Unlocker fallback: zone={zone} render=true")
+    html = ""
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                "https://api.brightdata.com/request",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "zone": zone,
+                    "url": url,
+                    "format": "raw",
+                    "country": "us",
+                    "render": True,
+                },
+                timeout=150,
+            )
+            brd_err = r.headers.get("x-brd-error") or ""
+            brd_code = r.headers.get("x-brd-error-code") or ""
+            if brd_err or brd_code:
+                last_err = f"{brd_code} {brd_err}".strip()
+                print(f"Unlocker attempt {attempt} blocked: {last_err}", file=sys.stderr)
+                time.sleep(2)
+                continue
+            html = r.text or ""
+            if r.ok and len(html) > 5000 and not looks_blocked(html, ""):
+                break
+            last_err = f"http_{r.status_code}_len_{len(html)}"
+            print(f"Unlocker attempt {attempt} weak body: {last_err}", file=sys.stderr)
+            html = ""
+        except Exception as e:
+            last_err = str(e)
+            print(f"Unlocker attempt {attempt} error: {e}", file=sys.stderr)
+        time.sleep(2)
+    if not html or len(html) < 5000:
+        print(f"Unlocker fallback failed: {last_err}", file=sys.stderr)
+        return None
+    if looks_blocked(html, ""):
+        print("Unlocker HTML still looks blocked", file=sys.stderr)
+        return None
+
+    title = ""
+    m = re.search(r"<title[^>]*>([^<]*)</title>", html, re.I)
+    if m:
+        title = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        try:
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            # Force desktop viewport meta so layout is not phone-width.
+            doc = re.sub(
+                r'<meta[^>]+name=["\']viewport["\'][^>]*>',
+                '<meta name="viewport" content="width=1920, initial-scale=1">',
+                html,
+                flags=re.I,
+            )
+            if not re.search(r'name=["\']viewport["\']', doc, re.I):
+                doc = re.sub(
+                    r"<head([^>]*)>",
+                    r'<head\1><meta name="viewport" content="width=1920, initial-scale=1">',
+                    doc,
+                    count=1,
+                    flags=re.I,
+                )
+            page.set_content(doc, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+            try:
+                title = (page.title() or title or "").strip()[:200]
+            except Exception:
+                pass
+            page.screenshot(path=screenshot_path, full_page=True)
+        finally:
+            browser.close()
+
+    if not os.path.exists(screenshot_path):
+        return None
+    content_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()
+    print(f"Unlocker fallback OK title={title[:60]}")
+    return {
+        "html": html,
+        "title": title,
+        "content_hash": content_hash,
+        "via": "unlocker_fallback",
+    }
+
+
 def main() -> int:
     url = env("CHECK_URL")
     if not url:
@@ -544,6 +648,18 @@ def main() -> int:
                 if ready:
                     break
                 print(f"Retrying with new session/country after attempt {attempt}")
+
+        # Browser API lost to DataDome — try Web Unlocker HTML → local screenshot (no clicks).
+        if (not ready or error) and not actions:
+            fb = try_unlocker_fallback(url, screenshot_path)
+            if fb:
+                html = fb["html"]
+                title = fb["title"]
+                content_hash = fb["content_hash"]
+                final_url = url
+                error = None
+                ready = True
+                print("Recovered via Unlocker fallback")
 
         if os.path.exists(screenshot_path):
             with open(screenshot_path, "rb") as sf:
