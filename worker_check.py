@@ -297,6 +297,17 @@ def looks_blocked(html: str, title: str) -> bool:
         return True
     if "access denied" in blob and ("viator" in blob or "tripadvisor" in blob):
         return True
+    if "access is temporarily restricted" in blob or "temporarily restricted" in blob:
+        return True
+    if "unusual activity from your device" in blob:
+        return True
+    # DataDome interstitial (Viator / TripAdvisor). Slider lives in an iframe.
+    if "captcha-delivery.com" in blob or "geo.captcha-delivery.com" in blob:
+        return True
+    if "#cmsg{" in blob or "ct.captcha-delivery.com" in blob:
+        return True
+    if "slide right to complete" in blob or "slide right to secure" in blob:
+        return True
     return False
 
 
@@ -338,15 +349,21 @@ def wait_until_unblocked(page, timeout_ms: int = 90000) -> bool:
 def navigate_ready(page, url: str) -> bool:
     """Goto + captcha wait + unblock poll. Returns False if still blocked."""
     page.goto(url, wait_until="domcontentloaded", timeout=120000)
-    wait_for_captcha_solve(page, detect_timeout_ms=90000)
+    status = wait_for_captcha_solve(page, detect_timeout_ms=90000)
     if wait_until_unblocked(page, timeout_ms=45000):
         return True
+    if status == "solve_failed":
+        print("Captcha solve_failed — not treating page as ready", file=sys.stderr)
+        return False
     # One reload retry — CF sometimes sticks on first paint.
     try:
         page.reload(wait_until="domcontentloaded", timeout=120000)
     except Exception:
         page.goto(url, wait_until="domcontentloaded", timeout=120000)
-    wait_for_captcha_solve(page, detect_timeout_ms=60000)
+    status = wait_for_captcha_solve(page, detect_timeout_ms=60000)
+    if status == "solve_failed":
+        print("Captcha solve_failed on retry — not treating page as ready", file=sys.stderr)
+        return False
     return wait_until_unblocked(page, timeout_ms=45000)
 
 
